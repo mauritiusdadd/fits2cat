@@ -34,10 +34,14 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 import sys
 import os
 import io
+import re
 import argparse
+
+import numpy as np
+import pandas as pd
+
 from astropy.table import Table
 from astropy.time import Time
-
 
 def __argshandler(options=None):
     """
@@ -73,11 +77,6 @@ def __argshandler(options=None):
     )
 
     parser.add_argument(
-        "--text-columns", type=str, metavar='TEXT_COLUMNS', default=None,
-        help='Columns to be safely converted to text.'
-    )
-
-    parser.add_argument(
         "--exclude-columns", type=str, metavar='EXCLUDE_COLUMNS', default=None,
         help='Columns to be excluded.'
     )
@@ -110,6 +109,9 @@ def main(args=None):
     args = __argshandler(args)
     basename = os.path.splitext(os.path.basename(args.catfile))[0]
 
+    my_cat = Table.read(args.catfile)
+    my_df = my_cat.to_pandas()
+
     header = ""
     if args.header is not None:
         try:
@@ -126,7 +128,48 @@ def main(args=None):
                 file=sys.stderr
             )
 
-    my_cat = Table.read(args.catfile)
+    # Evaluate expressions
+    res_map = {}
+    for m in re.finditer('{.*}', header):
+        expr = header[m.start()+1: m.end()-1]
+        if expr[-1] != ')':
+            print(f"WARNING: missing ) in expression: {expr}")
+            continue
+        func_name, args_str = expr[:-1].split('(')
+
+        func = None
+        if func_name == 'len':
+            func = len
+        if func_name == 'sum':
+            func = sum
+        elif func_name == 'sum':
+            func = np.sum
+        elif func_name == 'max':
+            func = np.max
+        elif func_name == 'min':
+            func = np.min
+        elif func_name == 'mean':
+            func = np.mean
+        elif func_name == 'std':
+            func = np.std
+        else:
+            print(
+                f"WARNING: Unknown function {func_name} in expression: {expr}"
+            )
+            continue
+
+        replaced_arg_str = args_str
+        for x in re.finditer(r'\$[^+*-/^=]+', args_str):
+            sub_str = args_str[x.start():x.end()]
+            replaced_arg_str = replaced_arg_str.replace(
+                sub_str, f"my_df.{sub_str[1:]}"
+            )
+
+        func_res = func(pd.eval(replaced_arg_str, target=my_df))
+        res_map[expr] = func_res
+
+    for expr, res in res_map.items():
+        header = header.replace(f'{{{expr}}}', f'{res}')
 
     for mask_val in args.mask_values.split(','):
         mask_val = float(mask_val)
@@ -136,10 +179,24 @@ def main(args=None):
             except Exception:
                 continue
 
-    if args.text_columns:
-        for col in args.text_columns.split(','):
-            for j, v in enumerate(my_cat[col]):
-                my_cat[col][j] = f'"{my_cat[col][j]}"'
+    for col in my_cat.colnames:
+        if (
+            isinstance(my_df[col].dtype, pd.StringDtype) or
+            my_df[col].dtype == 'object'
+        ):
+            try:
+                my_cat[col] = my_df[col].str.replace(' ','_')
+            except TypeError:
+                new_col = (
+                    (
+                        my_df[col]
+                        .str
+                        .decode("utf-8")
+                    ).str.strip()
+                ).str.replace(' ', '_')
+
+                my_cat[col] = new_col
+
 
     my_cat = my_cat.filled(-99)
 
@@ -152,7 +209,7 @@ def main(args=None):
         fh,
         format='ascii.fixed_width',
         delimiter=None,
-        bookend=False
+        bookend=False,
     )
 
     header += '#' + fh.getvalue().splitlines()[0][1:] + '\n'
